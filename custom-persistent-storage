@@ -1,0 +1,183 @@
+#!/bin/bash
+WIPER_SOCKET="/tmp/dw9k.sock"
+LOG="/dev/null"
+ACTIVE_PORTS="/tmp/active_ports"
+PORT=""
+IS_ACTIVE=""
+DISK="/dev/${MDEV}"
+RUN_LOG="=========================================================================="
+SPECS=""
+TITLE=""
+EXIT=""
+
+log_message() {
+    RUN_LOG="${RUN_LOG}"$'\n'"$1"
+}
+
+get_blockdev() {
+    log_message "${FUNCNAME[0]}"
+    ls /sys/class/block/*/device | grep -E 'Slot|/sys/' | grep "${1}" -B1 | grep -oE 'sd[a-z]'
+}
+
+get_port() {
+    log_message "${FUNCNAME[0]}"
+    DIR="/sys/class/block/${1}/device"
+    if [[ -d "${DIR}" ]]; then
+	ls "${DIR}" | grep 'Slot' | grep -oE '\d+'
+    fi
+}
+
+update_display() {
+    log_message "${FUNCNAME[0]}"
+    DISPLAY=""
+    if [[ ! -b "${DISK}" ]]; then
+	DISPLAY="EMPTY"
+    elif [[ -n "${TITLE}" ]]; then
+	DISPLAY="${TITLE}"
+    else
+	DISPLAY="???"
+    fi
+    echo "${PORT} ${DISPLAY} ${1}" | socat - UNIX-CONNECT:"${WIPER_SOCKET}"
+    log_message "${PORT} ${DISPLAY} ${1}"
+}
+
+run_and_log() {
+    local command=$1
+    shift
+    local args=("$@")
+    local OUTPUT
+    local EXIT_STATUS
+
+    log_message "${FUNCNAME[0]} ${command} ${args[*]}"
+
+    OUTPUT=$("$command" "${args[@]}" 2>&1)
+    EXIT_STATUS=$?
+
+    log_message "${OUTPUT}"
+
+    if [ $EXIT_STATUS -ne 0 ]; then
+	update_display "failed"
+	EXIT=$EXIT_STATUS
+        exit $EXIT_STATUS
+    fi
+
+    echo "${OUTPUT}"
+}
+
+handle_drive_restart() {
+    log_message "${FUNCNAME[0]}"
+    sleep 10
+    return_value=0
+    BLOCKDEV="$(get_blockdev ${PORT})"
+    if [[ -n "${BLOCKDEV}" && -z "$(echo ${DISK} | grep ${BLOCKDEV})" ]]; then
+	DISK="/dev/${BLOCKDEV}"
+	log_message"Disk changed to ${BLOCKDEV}"
+	return_value=1
+    fi
+    for attempt in {1..5}; do
+	if sg_readcap "${DISK}"; then
+	    break
+	else
+	    sleep 10
+	fi
+    done
+    BLOCKDEV="$(get_blockdev ${PORT})"
+    if [[ -n "${BLOCKDEV}" && -z "$(echo ${DISK} | grep ${BLOCKDEV})" ]]; then
+	DISK="/dev/${BLOCKDEV}"
+	return_value=1
+    fi
+    return $return_value
+}
+
+on_exit() {
+    local STATE=false
+    log_message "${FUNCNAME[0]}"
+    while [ -b "${DISK}" ]; do
+	if [ $EXIT -eq 2 ]; then
+	    if $STATE; then
+		update_display "none"
+		STATE=false
+	    else
+		update_display "working"
+		STATE=true
+	    fi
+	fi
+	sleep 2
+    done
+    update_display "none"
+    log_message "=========================================================================="
+    echo "${RUN_LOG}" >> $LOG
+    (
+	flock -x 200
+	grep -v "${PORT}" "${ACTIVE_PORTS}" > "${ACTIVE_PORTS}.tmp"
+	mv "${ACTIVE_PORTS}.tmp" "${ACTIVE_PORTS}"
+    ) 200>/var/lock/dw9k.lock
+}
+
+if [[ -f "/mnt/dw9k.log" ]]; then
+    log_message "1"
+    LOG="/mnt/dw9k.log"
+fi
+if [[ ! -f "${ACTIVE_PORTS}" ]]; then
+    log_message "2"
+    touch "${ACTIVE_PORTS}"
+fi
+if [[ -z "${MDEV}" ]]; then
+    log_message "3"
+    exit 0
+elif [[ -n "$(echo ${MDEV} | grep -oE '\d+')" ]]; then
+    log_message "4"
+    exit 0
+elif [[ ! -S "${WIPER_SOCKET}" ]]; then
+    log_message "5"
+    exit 0
+elif [[ -n "$(lsscsi -t | grep usb | grep ${MDEV})" ]]; then
+    log_message "6"
+    exit 0
+elif [[ ! -b "$DISK" ]]; then
+    log_message "7"
+    exit 0
+fi
+
+PORT="$(get_port ${MDEV})"
+SPECS="$(/root/dw9k/get_specs.sh $DISK)"
+TITLE="$(echo ${SPECS} | awk -F';' '{print "[" $1 "][" $8 "][" $7 "]"}' | sed 's/\s//g')"
+
+if grep -q "${PORT}" "${ACTIVE_PORTS}"; then
+    log_message "8"
+    exit 0
+else
+    log_message "9"
+    echo "${PORT}" >> "${ACTIVE_PORTS}"
+fi
+
+trap on_exit EXIT
+
+log_message "${SPECS}"
+log_message "${DISK}"
+update_display "working"
+log_message "SENTINAL CHECK 1"
+run_and_log /root/dw9k/sentinal.sh $DISK
+log_message "SMART CHECK 1"
+run_and_log /root/dw9k/smart_check.sh $DISK conveyance
+if handle_drive_restart; then
+    run_and_log /root/dw9k/smart_check.sh $DISK results
+fi
+log_message "WIPING..."
+OUTPUT=$(run_and_log /root/dw9k/wipe.sh $DISK)
+handle_drive_restart
+log_message "VERIFYING..."
+run_and_log python /root/dw9k/verify.py --device "$DISK"
+log_message "SENTINAL CHECK 2"
+OUTPUT=$(run_and_log /root/dw9k/sentinal.sh $DISK) 
+HEALTH="$(echo ${OUTPUT} | grep -oE '\d+' | head -1)"
+PERFORMANCE="$(echo ${OUTPUT} | grep -oE '\d+' | tail -1)"
+TITLE="${TITLE}[${HEALTH}]"
+log_message "SMART CHECK 2"
+run_and_log /root/dw9k/smart_check.sh $DISK short
+if handle_drive_restart; then
+    run_and_log /root/dw9k/smart_check.sh $DISK results
+fi
+cd /root/dw9k/
+python /root/dw9k/update_sheet.py "$(cat /root/dw9k/sheet)" "STORAGE;${SPECS};${HEALTH};${PERFORMANCE}"
+update_display "passed"
